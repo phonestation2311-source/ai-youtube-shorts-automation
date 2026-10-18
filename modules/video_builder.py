@@ -15,7 +15,8 @@ from config.settings import (
     OUTPUT_DIR, VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS,
     VIDEO_TARGET_DURATION, VIDEO_MAX_DURATION,
     FONT_SIZE, FONT_COLOR, FONT_BORDER_COLOR, FONT_BORDER_WIDTH,
-    BACKGROUND_MUSIC_VOLUME,
+    BACKGROUND_MUSIC_VOLUME, VIDEO_END_PADDING,
+    SUBTITLE_FONT, SUBTITLE_FONT_SIZE, SUBTITLE_MAX_WORDS, SUBTITLE_MARGIN_BOTTOM,
 )
 from utils import get_logger
 
@@ -72,6 +73,7 @@ def prepare_clip(clip_path: str, target_duration: float, output_path: str, clip_
 
     cmd = [
         "ffmpeg", "-y",
+        "-stream_loop", "-1",  # loop short clips so every segment is long enough
         "-i", clip_path,
         "-vf", (
             f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
@@ -88,9 +90,10 @@ def prepare_clip(clip_path: str, target_duration: float, output_path: str, clip_
         output_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode == 0:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        if result.returncode == 0 and get_media_duration(output_path) > 0:
             return output_path
+        log.warning(f"Clip prepare failed for {os.path.basename(clip_path)}: {result.stderr[-300:]}")
     except Exception as e:
         log.warning(f"Clip prepare failed: {e}")
     return ""
@@ -134,9 +137,10 @@ def concatenate_clips(clip_paths: List[str], total_duration: float, output_path:
         output_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode == 0:
             return output_path
+        log.error(f"Concat failed: {result.stderr[-300:]}")
     except Exception as e:
         log.error(f"Concat failed: {e}")
 
@@ -179,6 +183,105 @@ def generate_subtitle_file(script: str, duration: float, output_path: str) -> st
     return output_path
 
 
+def _ass_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h}:{m:02d}:{s:05.2f}"
+
+
+def _ass_escape(text: str) -> str:
+    return text.replace("\\", "/").replace("{", "(").replace("}", ")").replace("\n", " ")
+
+
+def _word_times(words: List[str], duration: float, word_timings: Optional[list]) -> List[tuple]:
+    """Start/end time for every word. Uses the voice's real word timings when they
+    line up with the script, otherwise spreads time by word length."""
+    if word_timings and len(word_timings) == len(words):
+        return [(t["start"], t["end"]) for t in word_timings]
+
+    if word_timings and len(word_timings) >= 2:
+        # Different word counts (e.g. punctuation/numbers): stretch over spoken span
+        start_all = word_timings[0]["start"]
+        end_all = word_timings[-1]["end"]
+    else:
+        start_all, end_all = 0.0, duration
+    weights = [max(len(w), 2) for w in words]
+    total = sum(weights) or 1
+    times, t = [], start_all
+    for w in weights:
+        d = (end_all - start_all) * w / total
+        times.append((t, t + d))
+        t += d
+    return times
+
+
+def generate_ass_subtitles(script: str, duration: float, output_path: str,
+                           word_timings: Optional[list] = None) -> str:
+    """
+    Create an .ass subtitle file sized for 1080x1920 with a Devanagari font.
+    Shows up to SUBTITLE_MAX_WORDS words at a time, synced to the narration.
+    """
+    words = script.split()
+    if not words:
+        return ""
+    times = _word_times(words, duration, word_timings)
+
+    # Group words into short lines; break after sentence/comma marks
+    chunks, current = [], []
+    for idx, w in enumerate(words):
+        current.append(idx)
+        if len(current) >= SUBTITLE_MAX_WORDS or re.search(r"[।!?,.]$", w):
+            chunks.append(current)
+            current = []
+    if current:
+        chunks.append(current)
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {VIDEO_WIDTH}
+PlayResY: {VIDEO_HEIGHT}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{SUBTITLE_FONT},{SUBTITLE_FONT_SIZE},&H00FFFFFF,&H0000FFFF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,6,3,2,70,70,{SUBTITLE_MARGIN_BOTTOM},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = []
+    for n, chunk in enumerate(chunks):
+        start = times[chunk[0]][0]
+        end = times[chunk[-1]][1]
+        if n + 1 < len(chunks):  # keep text on screen until the next line starts
+            end = max(end, times[chunks[n + 1][0]][0])
+        end = min(max(end, start + 0.3), duration + 1.0)
+        text = _ass_escape(" ".join(words[i] for i in chunk))
+        lines.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,{text}")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(header + "\n".join(lines) + "\n")
+
+    log.info(f"Subtitles generated: {len(chunks)} segments ({'word-synced' if word_timings else 'estimated timing'})")
+    return output_path
+
+
+def check_hindi_font() -> bool:
+    """Warn if no Devanagari font is installed (subtitles would show boxes)."""
+    try:
+        out = subprocess.run(["fc-list", ":lang=hi", "family"], capture_output=True, text=True, timeout=10).stdout
+        if out.strip():
+            return True
+    except Exception:
+        pass
+    log.warning("No Hindi (Devanagari) font found - subtitles may show boxes. "
+                "Fix: sudo apt-get install -y fonts-noto-core")
+    return False
+
+
 def format_srt_time(seconds: float) -> str:
     """Convert seconds to SRT time format."""
     hours = int(seconds // 3600)
@@ -194,6 +297,7 @@ def build_final_video(
     script: str,
     output_filename: str = "final_short.mp4",
     bg_music_path: str = "",
+    word_timings: Optional[list] = None,
 ) -> str:
     """
     Build the final YouTube Shorts video with professional quality:
@@ -211,7 +315,7 @@ def build_final_video(
         log.error("Could not determine voice duration")
         return ""
 
-    target_duration = min(voice_duration + 1.5, VIDEO_MAX_DURATION)
+    target_duration = min(voice_duration + VIDEO_END_PADDING, VIDEO_MAX_DURATION)
     log.info(f"Target video duration: {target_duration:.1f}s")
 
     # Step 2: Create base video from clips (with zoom/fade effects)
@@ -221,74 +325,65 @@ def build_final_video(
     else:
         create_color_background(target_duration, base_video)
 
-    # Step 3: Mix voice with background music
+    # Step 3: Mix voice with background music (music quietly underneath)
     final_audio = voice_path
     if bg_music_path and os.path.exists(bg_music_path):
-        mixed_audio = str(OUTPUT_DIR / "mixed_audio.mp3")
-        mix_cmd = [
-            "ffmpeg", "-y",
-            "-i", voice_path,
-            "-i", bg_music_path,
-            "-filter_complex",
-            f"[1:a]volume={BACKGROUND_MUSIC_VOLUME},afade=t=in:st=0:d=1,afade=t=out:st={max(0, target_duration-2)}:d=2[bg];"
-            f"[0:a]volume=1.0[voice];"
-            f"[voice][bg]amix=inputs=2:duration=first:dropout_transition=2[out]",
-            "-map", "[out]",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-t", str(target_duration),
-            mixed_audio,
-        ]
-        try:
-            result = subprocess.run(mix_cmd, capture_output=True, text=True, timeout=60)
-            if result.returncode == 0:
-                final_audio = mixed_audio
-                log.info("Background music mixed with voiceover (with fade in/out)")
-            else:
-                log.warning("Music mix failed, using voice only")
-        except Exception as e:
-            log.warning(f"Music mix error: {e}")
+        mixed_audio = str(OUTPUT_DIR / "mixed_audio.m4a")
+        fade_out_start = max(0, target_duration - 2)
+        base_filter = (
+            f"[1:a]volume={BACKGROUND_MUSIC_VOLUME},afade=t=in:st=0:d=1,"
+            f"afade=t=out:st={fade_out_start}:d=2[bg];"
+            f"[0:a]volume=1.0,apad[voice];"
+        )
+        # normalize=0 keeps the narration at full volume (needs FFmpeg 4.4+)
+        for amix in ("amix=inputs=2:duration=first:dropout_transition=2:normalize=0",
+                     "amix=inputs=2:duration=first:dropout_transition=2"):
+            mix_cmd = [
+                "ffmpeg", "-y",
+                "-i", voice_path,
+                "-stream_loop", "-1", "-i", bg_music_path,
+                "-filter_complex", f"{base_filter}[voice][bg]{amix}[out]",
+                "-map", "[out]",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-t", str(target_duration),
+                mixed_audio,
+            ]
+            try:
+                result = subprocess.run(mix_cmd, capture_output=True, text=True, timeout=120)
+                if result.returncode == 0:
+                    final_audio = mixed_audio
+                    log.info("Background music mixed under the narration (fade in/out)")
+                    break
+                log.warning(f"Music mix attempt failed: {result.stderr[-200:]}")
+            except Exception as e:
+                log.warning(f"Music mix error: {e}")
+        if final_audio == voice_path:
+            log.warning("Music mix failed, using voice only")
 
-    # Step 4: Generate subtitles
-    srt_path = str(OUTPUT_DIR / "subtitles.srt")
-    generate_subtitle_file(script, voice_duration, srt_path)
+    # Step 4: Generate Hindi subtitles (.ass, Devanagari font, synced to voice)
+    check_hindi_font()
+    sub_path = str(OUTPUT_DIR / "subtitles.ass")
+    generate_ass_subtitles(script, voice_duration, sub_path, word_timings)
 
-    # Step 5: Combine everything with professional subtitle styling
-    srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
-
-    # Professional subtitle style: white bold text with dark semi-transparent background
-    subtitle_filter = (
-        f"subtitles='{srt_escaped}'"
-        f":force_style='FontSize={FONT_SIZE},"
-        f"PrimaryColour=&H00FFFFFF,"
-        f"SecondaryColour=&H0000FFFF,"
-        f"OutlineColour=&H00000000,"
-        f"BackColour=&H80000000,"
-        f"BorderStyle=4,"
-        f"Outline=1,"
-        f"Shadow=0,"
-        f"Alignment=2,"
-        f"MarginV=120,"
-        f"MarginL=50,"
-        f"MarginR=50,"
-        f"FontName=Arial,"
-        f"Bold=1,"
-        f"Spacing=1'"
-    )
+    # Step 5: Combine everything
+    sub_escaped = sub_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    subtitle_filter = f"ass='{sub_escaped}'"
 
     cmd = [
         "ffmpeg", "-y",
         "-i", base_video,
         "-i", final_audio,
         "-filter_complex",
-        f"[0:v]{subtitle_filter}[v]",
+        f"[0:v]{subtitle_filter}[v];[1:a]apad[a]",
         "-map", "[v]",
-        "-map", "1:a",
+        "-map", "[a]",
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "20",
         "-c:a", "aac",
         "-b:a", "192k",
+        "-ar", "44100",
         "-pix_fmt", "yuv420p",
         "-r", str(VIDEO_FPS),
         "-t", str(target_duration),
@@ -301,20 +396,21 @@ def build_final_video(
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
         if result.returncode != 0:
-            log.warning("Subtitle overlay failed, trying without subtitles...")
+            log.warning(f"Subtitle overlay failed ({result.stderr[-300:]}), trying without subtitles...")
             cmd_simple = [
                 "ffmpeg", "-y",
                 "-i", base_video,
                 "-i", final_audio,
                 "-map", "0:v",
                 "-map", "1:a",
+                "-af", "apad",
                 "-c:v", "libx264",
                 "-preset", "medium",
                 "-crf", "20",
                 "-c:a", "aac",
                 "-b:a", "192k",
                 "-pix_fmt", "yuv420p",
-                "-shortest",
+                "-t", str(target_duration),
                 "-movflags", "+faststart",
                 output_path,
             ]
@@ -361,7 +457,7 @@ def extract_thumbnail(video_path: str, output_filename: str = "thumbnail.jpg", t
 def cleanup_temp_files():
     """Clean up temporary files in output directory."""
     patterns = ["prep_*.mp4", "base_video.mp4", "concat_list.txt",
-                "clip_*.mp4", "subtitles.srt", "mixed_audio.mp3"]
+                "clip_*.mp4", "subtitles.srt", "subtitles.ass", "mixed_audio.mp3", "mixed_audio.m4a"]
     for pattern in patterns:
         for f in OUTPUT_DIR.glob(pattern):
             try:
@@ -374,4 +470,4 @@ if __name__ == "__main__":
     print("Video Builder module loaded.")
     print(f"Output dir: {OUTPUT_DIR}")
     print(f"Video format: {VIDEO_WIDTH}x{VIDEO_HEIGHT} @ {VIDEO_FPS}fps")
-    print("Features: zoom transitions, fade effects, professional subtitles")
+    print("Features: fade effects, Hindi (Devanagari) subtitles, background music")

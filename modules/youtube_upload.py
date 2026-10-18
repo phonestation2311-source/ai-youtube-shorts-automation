@@ -17,65 +17,105 @@ import json
 import pickle
 from pathlib import Path
 from typing import Optional
-from config.settings import YOUTUBE_CLIENT_SECRET_FILE, YOUTUBE_TOKEN_FILE, OUTPUT_DIR
+from config.settings import YOUTUBE_CLIENT_SECRET_FILE, YOUTUBE_TOKEN_FILE, OUTPUT_DIR, UPLOAD_ENABLED, UPLOAD_APPROVED, MADE_FOR_KIDS
 from utils import get_logger
 
 log = get_logger("youtube")
 
 
-def get_authenticated_service():
-    """Get authenticated YouTube service."""
+# Minimal scopes: upload videos/thumbnails + read your own channel stats
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.readonly",
+]
+LOOPBACK_PORT = 8090
+
+
+def _save_token(creds):
+    """Save the token (pickle format) without printing it."""
+    os.makedirs(os.path.dirname(YOUTUBE_TOKEN_FILE), exist_ok=True)
+    with open(YOUTUBE_TOKEN_FILE, "wb") as f:
+        pickle.dump(creds, f)
     try:
+        os.chmod(YOUTUBE_TOKEN_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def get_authenticated_service(interactive: bool = False):
+    """Return a YouTube API client, or None if not connected.
+
+    One-time setup in Codespaces (Desktop OAuth client + localhost redirect):
+        python -m modules.youtube_upload --auth
+    """
+    try:
+        import urllib.parse
         from google_auth_oauthlib.flow import InstalledAppFlow
         from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
     except ImportError:
-        log.error(
-            "Missing packages. Run:\n"
-            "pip install google-api-python-client google-auth-oauthlib google-auth-httplib2"
-        )
+        log.error("Missing packages. Run: pip install google-api-python-client google-auth-oauthlib google-auth-httplib2")
         return None
 
-    SCOPES = ["https://www.googleapis.com/auth/youtube.upload",
-              "https://www.googleapis.com/auth/youtube"]
-
     creds = None
-
-    # Load saved token
     if os.path.exists(YOUTUBE_TOKEN_FILE):
         try:
             with open(YOUTUBE_TOKEN_FILE, "rb") as f:
                 creds = pickle.load(f)
         except Exception:
-            pass
+            log.warning("Saved YouTube token could not be read; please sign in again.")
+            creds = None
 
-    # If no valid token, authenticate
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception:
-                creds = None
+    if creds is not None and not set(SCOPES).issubset(set(creds.scopes or [])):
+        log.warning("Saved token has different permissions; please sign in again.")
+        creds = None
 
-        if not creds:
-            if not os.path.exists(YOUTUBE_CLIENT_SECRET_FILE):
-                log.error(
-                    f"client_secret.json not found at {YOUTUBE_CLIENT_SECRET_FILE}\n"
-                    "Download it from Google Cloud Console → APIs & Services → Credentials"
-                )
-                return None
+    if creds is not None and not creds.valid and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            _save_token(creds)
+        except Exception as e:
+            log.warning(f"Token refresh failed ({type(e).__name__}); please sign in again.")
+            creds = None
 
-            flow = InstalledAppFlow.from_client_secrets_file(
-                YOUTUBE_CLIENT_SECRET_FILE, SCOPES
-            )
-            creds = flow.run_local_server(port=8090)
+    if creds is None or not creds.valid:
+        if not interactive:
+            log.error("YouTube is not connected. Run once: python -m modules.youtube_upload --auth")
+            return None
+        if not os.path.exists(YOUTUBE_CLIENT_SECRET_FILE):
+            log.error(f"OAuth client file not found: {YOUTUBE_CLIENT_SECRET_FILE}")
+            return None
+        with open(YOUTUBE_CLIENT_SECRET_FILE, encoding="utf-8") as f:
+            kind = next(iter(json.load(f)), "")
+        if kind != "installed":
+            log.error("config/client_secret.json must be a Desktop app OAuth client (it starts with installed).")
+            return None
 
-        # Save token
-        with open(YOUTUBE_TOKEN_FILE, "wb") as f:
-            pickle.dump(creds, f)
+        flow = InstalledAppFlow.from_client_secrets_file(YOUTUBE_CLIENT_SECRET_FILE, SCOPES)
+        flow.redirect_uri = f"http://localhost:{LOOPBACK_PORT}/"
+        auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
+        print("\n1) Ctrl+Click (or copy) this link and sign in with your YouTube channel account:\n")
+        print(auth_url)
+        print("\n2) After you click Continue/Allow, the browser shows a page that cannot be reached.")
+        print("   That is expected. Copy the FULL address from the address bar (starts with http://localhost:8090/).")
+        response = input("\n3) Paste that address here and press Enter: ").strip()
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(response).query)
+        if "error" in params:
+            log.error(f"Google returned an error: {params['error'][0]}")
+            return None
+        if params.get("state", [None])[0] != state:
+            log.error("That address does not match this login attempt. Run --auth again and use the newest link.")
+            return None
+        code = params.get("code", [None])[0]
+        if not code:
+            log.error("No authorization code found in the pasted address.")
+            return None
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        _save_token(creds)
+        log.info("YouTube connected. Token saved (contents not shown).")
 
-    return build("youtube", "v3", credentials=creds)
+    return build("youtube", "v3", credentials=creds, cache_discovery=False)
 
 
 def upload_video(
@@ -83,14 +123,18 @@ def upload_video(
     title: str,
     description: str,
     tags: list = None,
-    category_id: str = "28",  # 28 = Science & Technology
-    privacy: str = "public",
+    category_id: str = "24",  # 24 = Entertainment (kids stories)
+    privacy: str = "private",  # private first, so you can review on YouTube
     is_short: bool = True,
 ) -> Optional[str]:
     """
     Upload a video to YouTube.
     Returns the video ID if successful.
     """
+    if not (UPLOAD_ENABLED and UPLOAD_APPROVED):
+        log.warning("Upload blocked: needs BOTH UPLOAD_ENABLED=true and UPLOAD_APPROVED=true in .env.")
+        return None
+
     from googleapiclient.http import MediaFileUpload
     from googleapiclient.errors import HttpError
 
@@ -109,7 +153,7 @@ def upload_video(
         if "#Shorts" not in description:
             description = f"{description}\n\n#Shorts"
 
-    tags = tags or ["shorts", "viral", "facts"]
+    tags = tags or ["shorts", "hindi kahani", "kids story"]
 
     body = {
         "snippet": {
@@ -120,7 +164,7 @@ def upload_video(
         },
         "status": {
             "privacyStatus": privacy,
-            "selfDeclaredMadeForKids": False,
+            "selfDeclaredMadeForKids": MADE_FOR_KIDS,
         },
     }
 
@@ -161,6 +205,10 @@ def upload_video(
 
 def set_thumbnail(video_id: str, thumbnail_path: str) -> bool:
     """Set custom thumbnail for a video."""
+    if not (UPLOAD_ENABLED and UPLOAD_APPROVED):
+        log.warning("Upload blocked: needs BOTH UPLOAD_ENABLED=true and UPLOAD_APPROVED=true in .env.")
+        return None
+
     from googleapiclient.http import MediaFileUpload
 
     youtube = get_authenticated_service()
@@ -208,6 +256,15 @@ def get_channel_analytics() -> dict:
 
 
 if __name__ == "__main__":
-    print("YouTube Uploader module loaded.")
-    print(f"Client secret: {YOUTUBE_CLIENT_SECRET_FILE}")
-    print(f"Token file: {YOUTUBE_TOKEN_FILE}")
+    import sys
+    if "--auth" in sys.argv:
+        yt = get_authenticated_service(interactive=True)
+        if yt:
+            info = get_channel_analytics()
+            print(f"Connected to channel: {info.get('channel_name') or '(name not available)'}")
+            print("Uploads stay OFF until UPLOAD_ENABLED and UPLOAD_APPROVED are both true.")
+        else:
+            print("Not connected - see the message above.")
+    else:
+        print("YouTube Uploader module loaded.")
+        print("Connect once with: python -m modules.youtube_upload --auth")

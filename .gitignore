@@ -31,3 +31,22 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
+.env
+config/youtube_token*.pickle
+*.pickle
+.backup_before_oauth/
+.backup_before_update/
+
+# Run history / locks (local only)
+state/
+config/client_secret*
+config/youtube_token*
+.env.*
+!.env.example
+
+# Broken folder name + backups (never commit)
+/{assets,output,templates,logs,config}/
+*.backup
+*.mp3
+*.mp4

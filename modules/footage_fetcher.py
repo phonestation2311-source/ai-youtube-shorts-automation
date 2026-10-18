@@ -11,10 +11,16 @@ import time
 import random
 from pathlib import Path
 from typing import List, Optional
-from config.settings import PEXELS_API_KEY, OUTPUT_DIR, VIDEO_WIDTH, VIDEO_HEIGHT
+from config.settings import (
+    PEXELS_API_KEY, OUTPUT_DIR, VIDEO_WIDTH, VIDEO_HEIGHT, FOOTAGE_PROVIDERS, MIN_FOOTAGE_CLIPS,
+)
 from utils import get_logger
 
 log = get_logger("footage")
+
+
+def _pexels_key_ok() -> bool:
+    return bool(PEXELS_API_KEY) and not PEXELS_API_KEY.startswith("YOUR_")
 
 
 def search_pexels_videos(
@@ -26,8 +32,8 @@ def search_pexels_videos(
 ) -> List[dict]:
     """Search for videos on Pexels."""
 
-    if PEXELS_API_KEY == "YOUR_PEXELS_KEY":
-        log.warning("Pexels API key not set! Get one free at https://www.pexels.com/api/")
+    if not _pexels_key_ok():
+        log.warning("Pexels API key not set. Add PEXELS_API_KEY to .env (free at https://www.pexels.com/api/)")
         return []
 
     url = "https://api.pexels.com/videos/search"
@@ -67,7 +73,8 @@ def search_pexels_videos(
 
                 if best_file:
                     videos.append({
-                        "id": video.get("id"),
+                        "id": f"pexels_{video.get('id')}",
+                        "source": "pexels",
                         "url": best_file.get("link"),
                         "width": best_file.get("width"),
                         "height": best_file.get("height"),
@@ -87,54 +94,80 @@ def search_pexels_videos(
 
 
 def download_video(url: str, filename: str) -> str:
-    """Download a video file."""
+    """Download a video file. Returns "" if it fails or the file is broken."""
     output_path = str(OUTPUT_DIR / filename)
 
     try:
         log.info(f"Downloading: {filename}")
-        resp = requests.get(url, stream=True, timeout=60)
+        resp = requests.get(url, stream=True, timeout=90)
         resp.raise_for_status()
 
         with open(output_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
                 f.write(chunk)
+
+        if os.path.getsize(output_path) < 50 * 1024:
+            log.warning(f"Downloaded file is too small, skipping: {filename}")
+            os.remove(output_path)
+            return ""
 
         log.info(f"Downloaded: {output_path}")
         return output_path
 
     except Exception as e:
-        log.error(f"Download failed: {e}")
+        log.error(f"Download failed: {type(e).__name__}")
         return ""
+
+
+def _search(provider: str, query: str, count: int) -> List[dict]:
+    if provider == "pixabay":
+        from modules.pixabay_fetcher import search_pixabay_videos
+        return search_pixabay_videos(query, count=count)
+    if provider == "pexels":
+        return search_pexels_videos(query, count=count, orientation="portrait", min_duration=4, max_duration=60)
+    return []
 
 
 def fetch_footage_for_keywords(keywords: List[str], clips_per_keyword: int = 1) -> List[str]:
     """
-    Fetch stock footage for multiple keywords.
-    Tries Pexels first, falls back to Pixabay.
-    Returns list of downloaded file paths.
+    Fetch stock footage for each keyword.
+    Tries Pixabay first, then Pexels (order set in settings.FOOTAGE_PROVIDERS).
+    Never downloads the same video twice. Adds general cute-animal clips
+    if too few were found. Returns list of downloaded file paths.
     """
     downloaded = []
+    used_ids = set()
+    fallback = ["cute baby animals", "funny animals", "animals in nature"]
+    queries = list(keywords)
 
-    for i, kw in enumerate(keywords):
-        # Try Pexels first
-        videos = search_pexels_videos(kw, count=clips_per_keyword, orientation="portrait")
-
-        # Fallback to Pixabay if Pexels fails
-        if not videos:
+    i = 0
+    while i < len(queries):
+        kw = queries[i]
+        got = 0
+        for provider in FOOTAGE_PROVIDERS:
+            if got >= clips_per_keyword:
+                break
             try:
-                from modules.pixabay_fetcher import search_pixabay_videos
-                videos = search_pixabay_videos(kw, count=clips_per_keyword)
-                log.info(f"Using Pixabay fallback for '{kw}'")
-            except ImportError:
-                pass
+                videos = _search(provider, kw, clips_per_keyword)
+            except Exception as e:
+                log.warning(f"{provider} search error for '{kw}': {type(e).__name__}")
+                videos = []
+            for video in videos:
+                if got >= clips_per_keyword:
+                    break
+                if video["id"] in used_ids:
+                    continue
+                path = download_video(video["url"], f"clip_{len(downloaded)}.mp4")
+                if path:
+                    used_ids.add(video["id"])
+                    downloaded.append(path)
+                    got += 1
+                    log.info(f"Clip for '{kw}' from {provider}")
+            time.sleep(0.3)  # Be gentle with the free APIs
 
-        for j, video in enumerate(videos):
-            filename = f"clip_{i}_{j}.mp4"
-            path = download_video(video["url"], filename)
-            if path:
-                downloaded.append(path)
-
-        time.sleep(0.5)  # Rate limiting
+        i += 1
+        if i == len(queries) and len(downloaded) < MIN_FOOTAGE_CLIPS and fallback:
+            queries.append(fallback.pop(0))
 
     log.info(f"Total clips downloaded: {len(downloaded)}")
     return downloaded
@@ -143,7 +176,7 @@ def fetch_footage_for_keywords(keywords: List[str], clips_per_keyword: int = 1) 
 def search_pexels_images(query: str, count: int = 1, orientation: str = "portrait") -> List[dict]:
     """Search for images on Pexels (for thumbnails/backgrounds)."""
 
-    if PEXELS_API_KEY == "YOUR_PEXELS_KEY":
+    if not _pexels_key_ok():
         return []
 
     url = "https://api.pexels.com/v1/search"
@@ -174,6 +207,6 @@ def search_pexels_images(query: str, count: int = 1, orientation: str = "portrai
 
 if __name__ == "__main__":
     # Test
-    keywords = ["technology", "robot", "future city"]
+    keywords = ["cute rabbit", "baby elephant", "squirrel"]
     clips = fetch_footage_for_keywords(keywords, clips_per_keyword=1)
     print(f"Downloaded {len(clips)} clips")

@@ -1,179 +1,164 @@
 """
-Script Quality Checker
-Validates and scores scripts before video creation.
-Ensures hooks are strong, length is right, and content is engaging.
+Script Quality Checker - Hindi kids' animal stories
+Validates a story before the video is made:
+Hindi (Devanagari), right length, short hook, story shape, clean text, child safe.
 """
 
 import re
 from typing import Tuple
-from modules.ai_engine import ask_ollama
+
+from config.settings import STORY_MAX_WORDS, STORY_MIN_WORDS
+from modules.ai_engine import (
+    ask_ollama,
+    clean_story_text,
+    count_words,
+    detect_animals,
+    devanagari_ratio,
+    is_child_safe,
+    split_sentences,
+)
 from utils import get_logger
 
 log = get_logger("quality")
 
-# Ideal ranges
-MIN_WORDS = 40
-MAX_WORDS = 100
-MIN_SENTENCES = 3
-MAX_SENTENCES = 12
+# Allowed range (a little wider than the target; voice speed is fine-tuned later)
+MIN_WORDS = STORY_MIN_WORDS - 10
+MAX_WORDS = STORY_MAX_WORDS + 15
+MIN_SENTENCES = 5
 IDEAL_HOOK_MAX_WORDS = 12
+
+# Checks that MUST pass, otherwise the story is not used
+REQUIRED_CHECKS = ("hindi_script", "child_safe", "word_count")
 
 
 def check_word_count(script: str) -> Tuple[bool, str]:
-    """Check if script word count is in the ideal range."""
-    words = len(script.split())
+    words = count_words(script)
     if words < MIN_WORDS:
-        return False, f"Too short ({words} words, need {MIN_WORDS}+)"
+        return False, f"Too short ({words} words, need {STORY_MIN_WORDS}-{STORY_MAX_WORDS})"
     if words > MAX_WORDS:
-        return False, f"Too long ({words} words, max {MAX_WORDS})"
+        return False, f"Too long ({words} words, need {STORY_MIN_WORDS}-{STORY_MAX_WORDS})"
     return True, f"Word count OK ({words})"
 
 
+def check_hindi_script(script: str) -> Tuple[bool, str]:
+    ratio = devanagari_ratio(script)
+    if ratio < 0.85:
+        return False, f"Not enough Hindi/Devanagari text ({ratio:.0%})"
+    return True, f"Hindi Devanagari OK ({ratio:.0%})"
+
+
 def check_hook_strength(script: str) -> Tuple[bool, str]:
-    """Check if the opening hook is strong."""
-    first_sentence = script.split(".")[0].strip() if "." in script else script[:60]
-    word_count = len(first_sentence.split())
-
-    if word_count > IDEAL_HOOK_MAX_WORDS:
-        return False, f"Hook too long ({word_count} words, max {IDEAL_HOOK_MAX_WORDS})"
-
-    # Check for weak openings
-    weak_starts = ["hi", "hello", "welcome", "today", "in this video", "so", "well",
-                   "let me", "i want to", "have you ever"]
-    first_lower = first_sentence.lower()
-    for weak in weak_starts:
-        if first_lower.startswith(weak):
-            return False, f"Weak hook start: '{weak}...'"
-
-    return True, f"Hook looks strong ({word_count} words)"
+    sentences = split_sentences(script)
+    first = sentences[0] if sentences else script[:60]
+    n = count_words(first)
+    if n > IDEAL_HOOK_MAX_WORDS:
+        return False, f"Opening sentence too long ({n} words, max {IDEAL_HOOK_MAX_WORDS})"
+    return True, f"Opening is short ({n} words)"
 
 
-def check_has_question(script: str) -> Tuple[bool, str]:
-    """Check if script ends with a question (for engagement/loop)."""
-    last_sentence = script.strip().split(".")[-1].strip()
-    if not last_sentence:
-        sentences = script.strip().split(".")
-        last_sentence = sentences[-2].strip() if len(sentences) > 1 else ""
-
-    has_question = "?" in script[-100:]  # Check last 100 chars
-    if has_question:
-        return True, "Ends with engagement question"
-    return False, "Missing engagement question at the end"
+def check_story_shape(script: str) -> Tuple[bool, str]:
+    n = len(split_sentences(script))
+    if n < MIN_SENTENCES:
+        return False, f"Too few sentences for a story ({n})"
+    if not detect_animals(script):
+        return False, "No animal character found in the story"
+    return True, f"Story has {n} sentences and animal characters"
 
 
-def check_no_filler(script: str) -> Tuple[bool, str]:
-    """Check for filler words that hurt retention."""
-    filler_words = ["basically", "actually", "literally", "kind of", "sort of",
-                    "you know", "like", "um", "uh", "so yeah"]
-    found = []
-    lower = script.lower()
-    for filler in filler_words:
-        if filler in lower:
-            found.append(filler)
+def check_clean_text(script: str) -> Tuple[bool, str]:
+    if re.search(r"[*#`\[\]{}<>]|^\s*-", script):
+        return False, "Contains markdown or formatting symbols"
+    if re.search(r"[A-Za-z]{3,}", script):
+        return False, "Contains English words"
+    return True, "Clean narration text"
 
-    if found:
-        return False, f"Filler words found: {', '.join(found)}"
-    return True, "No filler words"
+
+def check_child_safe(script: str) -> Tuple[bool, str]:
+    if not is_child_safe(script):
+        return False, "Contains words that are not suitable for children"
+    return True, "Child safe"
 
 
 def validate_script(script: str) -> dict:
-    """
-    Run all quality checks on a script.
-    Returns dict with overall score and details.
-    """
+    """Run all checks. Returns score, details and approved flag."""
     checks = {
+        "hindi_script": check_hindi_script(script),
         "word_count": check_word_count(script),
+        "child_safe": check_child_safe(script),
         "hook_strength": check_hook_strength(script),
-        "engagement_question": check_has_question(script),
-        "no_filler": check_no_filler(script),
+        "story_shape": check_story_shape(script),
+        "clean_text": check_clean_text(script),
     }
-
     passed = sum(1 for ok, _ in checks.values() if ok)
     total = len(checks)
-    score = round((passed / total) * 100)
+    score = round(passed / total * 100)
+    required_ok = all(checks[name][0] for name in REQUIRED_CHECKS)
 
     result = {
         "score": score,
         "passed": passed,
         "total": total,
         "checks": {name: {"pass": ok, "message": msg} for name, (ok, msg) in checks.items()},
-        "approved": score >= 50,  # At least half must pass
+        "required_ok": required_ok,
+        "approved": required_ok and score >= 65,
     }
 
     log.info(f"Script quality: {score}% ({passed}/{total} checks passed)")
     for name, (ok, msg) in checks.items():
-        icon = "✓" if ok else "✗"
-        log.debug(f"  {icon} {name}: {msg}")
-
+        log.info(f"  {'OK ' if ok else 'BAD'} {name}: {msg}")
     return result
 
 
 def ai_quality_score(script: str) -> int:
-    """Use AI to score the script 1-10."""
-    prompt = f"""Rate this YouTube Shorts script from 1-10 for viral potential.
+    """Ask the AI to rate the kids' story 1-10 (optional helper)."""
+    prompt = f"""Rate this Hindi children's animal story from 1 to 10 for a YouTube Short for kids.
+Consider: engaging opening, cute characters, clear small problem, kind/clever solution, happy ending, simple Hindi, child safety.
 
-SCRIPT: {script}
+STORY: {script}
 
-Consider:
-- Hook strength (does it stop the scroll?)
-- Curiosity (does it create an open loop?)
-- Pacing (short punchy sentences?)
-- Twist (is there a surprising element?)
-- Engagement (does it encourage comments/shares?)
-
-Return ONLY a single number from 1 to 10. Nothing else:"""
-
-    response = ask_ollama(prompt)
-    try:
-        # Extract number from response
-        numbers = re.findall(r'\d+', response)
-        if numbers:
-            score = int(numbers[0])
-            return min(max(score, 1), 10)
-    except Exception:
-        pass
-    return 5  # Default middle score
+Return ONLY one number from 1 to 10."""
+    response = ask_ollama(prompt, max_tokens=400)
+    numbers = re.findall(r"\d+", response or "")
+    if numbers:
+        return min(max(int(numbers[0]), 1), 10)
+    return 5
 
 
 def improve_script(script: str, issues: list) -> str:
-    """Ask AI to fix specific issues in the script."""
-    issues_text = "\n".join([f"- {issue}" for issue in issues])
-
-    prompt = f"""Rewrite this YouTube Shorts script fixing these issues:
-
-ISSUES:
+    """Ask the AI to fix the listed issues. Keeps the original if the rewrite is worse."""
+    issues_text = "\n".join(f"- {issue}" for issue in issues)
+    prompt = f"""Rewrite this Hindi children's animal story and fix these problems:
 {issues_text}
 
-CURRENT SCRIPT:
+STORY:
 {script}
 
 Rules:
-- Keep it 60-80 words
-- Strong hook under 10 words
-- End with an engagement question
-- No filler words
-- Short punchy sentences
+- Simple, natural Hindi in Devanagari only (no English words).
+- {STORY_MIN_WORDS}-{STORY_MAX_WORDS} words.
+- First sentence under 12 words and exciting.
+- Keep the same animal characters and names; small problem, kind or clever solution, happy ending, short lesson at the end.
+- Completely safe and gentle for small children.
+- Return ONLY the story as one paragraph. No title, no markdown, no notes."""
 
-Return ONLY the rewritten script, nothing else:"""
-
-    improved = ask_ollama(prompt)
-    if improved and len(improved) > 20:
+    improved = clean_story_text(ask_ollama(prompt, max_tokens=2500))
+    if not improved:
+        return script
+    old_q, new_q = validate_script(script), validate_script(improved)
+    if new_q["required_ok"] and new_q["score"] >= old_q["score"]:
         return improved
-    return script  # Return original if improvement fails
+    log.info("Rewrite was not better, keeping the original story.")
+    return script
 
 
 if __name__ == "__main__":
     test_script = (
-        "This AI just replaced 1000 employees overnight. "
-        "A major tech company quietly deployed an AI system that handles "
-        "all customer support. The crazy part? Customer satisfaction actually "
-        "went up by 30 percent. Nobody noticed the difference. "
-        "What job do you think AI will replace next?"
+        "जंगल में आज एक अजीब आवाज़ आई! छोटा खरगोश चीकू डर गया। "
+        "उसने देखा, उसका दोस्त कछुआ मोती एक गड्ढे में फँसा था। "
+        "चीकू ने सोचा, मैं अकेले उसे नहीं निकाल सकता। "
+        "वह दौड़कर हाथी गोलू को बुला लाया। गोलू ने अपनी लंबी सूँड बढ़ाई। "
+        "मोती ने सूँड पकड़ी और धीरे से बाहर आ गया। तीनों दोस्त खुशी से नाचने लगे। "
+        "सीख: मुश्किल में दोस्तों की मदद करो।"
     )
-
-    print("Validating script...")
     result = validate_script(test_script)
-    print(f"\nScore: {result['score']}%")
-    for name, check in result["checks"].items():
-        icon = "✓" if check["pass"] else "✗"
-        print(f"  {icon} {name}: {check['message']}")
+    print(f"\nScore: {result['score']}%  approved={result['approved']}")

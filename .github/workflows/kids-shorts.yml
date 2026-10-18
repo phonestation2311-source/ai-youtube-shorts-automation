@@ -1,0 +1,92 @@
+# Runs on GitHub's servers, so it keeps working when your Codespace is stopped.
+# Change the cron line to change how often it runs (times are UTC; SA = UTC+2).
+name: Hindi kids shorts (scheduled)
+
+on:
+  schedule:
+    - cron: "30 4 * * *"   # every day at 06:30 South Africa time
+  workflow_dispatch: {}      # "Run workflow" button for a manual test
+
+concurrency:
+  group: kids-shorts
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  make-short:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+      PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+      NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      # Upload stays OFF unless you set BOTH repository variables to true.
+      UPLOAD_ENABLED: ${{ vars.UPLOAD_ENABLED || 'false' }}
+      UPLOAD_APPROVED: ${{ vars.UPLOAD_APPROVED || 'false' }}
+      MAX_ATTEMPTS: "2"
+      RETRY_DELAY_SECONDS: "60"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install FFmpeg and Hindi font
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg fonts-noto-core
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Restore run history (duplicate protection)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: kids-shorts-state-${{ github.run_id }}
+          restore-keys: kids-shorts-state-
+
+      - name: Add YouTube login (only needed for publishing)
+        env:
+          YOUTUBE_TOKEN_B64: ${{ secrets.YOUTUBE_TOKEN_B64 }}
+        run: |
+          if [ -n "$YOUTUBE_TOKEN_B64" ]; then
+            echo "$YOUTUBE_TOKEN_B64" | base64 -d > config/youtube_token.pickle
+          fi
+
+      - name: Readiness check
+        run: python run_job.py --check
+
+      - name: Make one video (uploads only if both gates are true)
+        run: python run_job.py --once
+
+      - name: Check the video
+        run: python -m tools.check_outputs --latest
+
+      - name: Save run history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: kids-shorts-state-${{ github.run_id }}
+
+      - name: Keep video for review (7 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kids-short-${{ github.run_id }}
+          path: |
+            output/short_*.mp4
+            output/short_*.json
+            output/thumb_*.jpg
+            logs/automation.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Remove YouTube login from runner
+        if: always()
+        run: rm -f config/youtube_token.pickle

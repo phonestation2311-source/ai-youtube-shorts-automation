@@ -78,12 +78,18 @@ def print_system_status():
 
 def print_config_status():
     """Check API keys and config."""
-    from config.settings import PEXELS_API_KEY, YOUTUBE_CLIENT_SECRET_FILE
+    from config.settings import PEXELS_API_KEY, PIXABAY_API_KEY, YOUTUBE_CLIENT_SECRET_FILE, UPLOAD_ENABLED
 
     print_section("Configuration")
 
+    def _set(key):
+        return bool(key) and not key.startswith("YOUR_")
+
     configs = {
-        "Pexels API Key": PEXELS_API_KEY != "YOUR_PEXELS_KEY",
+        "Groq API Key": _set(os.getenv("GROQ_API_KEY", "")),
+        "Pixabay API Key": _set(PIXABAY_API_KEY),
+        "Pexels API Key": _set(PEXELS_API_KEY),
+        "Upload disabled (safe)": not UPLOAD_ENABLED,
         "YouTube client_secret.json": os.path.exists(YOUTUBE_CLIENT_SECRET_FILE),
         "Output directory": os.path.exists(str(OUTPUT_DIR)),
         "Logs directory": os.path.exists(str(LOGS_DIR)),

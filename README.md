@@ -1,3 +1,35 @@
+# Hindi Kids Animal Story Shorts (current mode)
+
+This project now makes **original Hindi (Devanagari) animal stories for kids** as
+vertical 1080x1920, 30 FPS YouTube Shorts (about 35-45 seconds):
+
+Groq story idea → Hindi story → opening line → quality/safety check → title/tags →
+Hindi voice (`hi-IN-MadhurNeural`) → Pixabay footage (Pexels backup) →
+Hindi subtitles + quiet background music → MP4 in `output/`.
+
+**Uploading is OFF.** Videos and a `.json` file with the title, description and tags
+are saved in `output/` for you to review. Upload only happens if you add
+`UPLOAD_ENABLED=true` to `.env` (videos are then uploaded as *private* and *made for kids*).
+
+One-time setup in Codespaces (free):
+
+```bash
+sudo apt-get install -y fonts-noto-core   # Hindi font for subtitles
+pip install -r requirements.txt
+```
+
+Make one test video (no upload):
+
+```bash
+python main.py --mode single --dry-run
+```
+
+Offline tests (no keys, no internet): `python -m unittest discover -s tests -v`
+
+Put your own royalty-free music (.mp3) in `assets/music/`.
+
+---
+
 # YouTube Shorts Automation System
 
 A **100% FREE**, fully autonomous YouTube Shorts creation and upload system.
@@ -367,3 +399,23 @@ Edit `config/settings.py` → `VOICE_NAME`:
 - First YouTube upload requires browser authentication
 - System respects API rate limits automatically
 - Automation helps with scale; success depends on niche + hooks + consistency
+
+## Unattended automation (uploads OFF by default)
+
+| Command | What it does |
+|---|---|
+| `python run_job.py --check` | Free readiness check (keys present, ffmpeg, Hindi font, upload gate) |
+| `python run_job.py --once` | Make one video now (lock, 2 attempts max, failure notification) |
+| `python -m tools.check_outputs` | Check every video in `output/` (size, FPS, length, audio, title, tags, thumbnail) |
+| `python -m unittest discover -s tests -v` | Offline tests (no keys, no internet) |
+
+**Schedule:** `.github/workflows/kids-shorts.yml` runs on GitHub's servers every day at
+06:30 SA time (edit the `cron` line to change). It works even when the Codespace is stopped.
+Each video is kept 7 days under the run's *Artifacts* for review.
+`python run_job.py --loop` also exists, but it stops when the Codespace stops.
+
+**Safety:** uploads need BOTH `UPLOAD_ENABLED=true` and `UPLOAD_APPROVED=true`.
+Before uploading, the same file/title is checked against `state/upload_ledger.json` and your
+channel's recent uploads, so a video is never published twice.
+Failures: GitHub emails you when a scheduled run fails; optional `NOTIFY_WEBHOOK_URL`
+(Discord/Slack) or `NTFY_TOPIC` (ntfy.sh phone push) secrets send an instant message.
