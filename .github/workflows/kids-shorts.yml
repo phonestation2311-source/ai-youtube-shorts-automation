@@ -60,6 +60,16 @@ jobs:
           printf '%s' "$YOUTUBE_TOKEN_B64" | base64 --decode > config/youtube_token.pickle
           test -s config/youtube_token.pickle
 
+      - name: Validate saved YouTube token (no upload)
+        env:
+          YOUTUBE_TOKEN_B64: ${{ secrets.YOUTUBE_TOKEN_B64 }}
+        run: |
+          set -eu
+          test -n "$YOUTUBE_TOKEN_B64"
+          printf '%s' "$YOUTUBE_TOKEN_B64" | base64 --decode > /tmp/youtube-token-check.pickle
+          python -c 'import pickle; pickle.load(open("/tmp/youtube-token-check.pickle", "rb")); print("YouTube token format: valid")'
+          rm -f /tmp/youtube-token-check.pickle
+
       - name: Readiness check
         run: python run_job.py --check
 
