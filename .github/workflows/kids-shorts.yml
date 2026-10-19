@@ -51,12 +51,14 @@ jobs:
           restore-keys: kids-shorts-state-
 
       - name: Add YouTube login (only needed for publishing)
+        if: env.UPLOAD_ENABLED == 'true' && env.UPLOAD_APPROVED == 'true'
         env:
           YOUTUBE_TOKEN_B64: ${{ secrets.YOUTUBE_TOKEN_B64 }}
         run: |
-          if [ -n "$YOUTUBE_TOKEN_B64" ]; then
-            echo "$YOUTUBE_TOKEN_B64" | base64 -d > config/youtube_token.pickle
-          fi
+          set -eu
+          test -n "$YOUTUBE_TOKEN_B64"
+          printf '%s' "$YOUTUBE_TOKEN_B64" | base64 --decode > config/youtube_token.pickle
+          test -s config/youtube_token.pickle
 
       - name: Readiness check
         run: python run_job.py --check
