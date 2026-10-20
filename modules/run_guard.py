@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import time
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +55,16 @@ def _write_json(path: Path, data):
 # ------------------------------------------------------------------
 # Single-run lock
 # ------------------------------------------------------------------
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class AlreadyRunning(RuntimeError):
     pass
 
@@ -68,13 +79,20 @@ class RunLock:
     def __enter__(self):
         if self.path.exists():
             age = time.time() - self.path.stat().st_mtime
-            if age < LOCK_STALE_SECONDS:
+            stale = age >= LOCK_STALE_SECONDS
+            try:  # lock left by a crashed/cancelled run on this machine?
+                pid_s, host = self.path.read_text().split()[:2]
+                if host == socket.gethostname() and not _pid_alive(int(pid_s)):
+                    stale = True
+            except (OSError, ValueError):
+                pass
+            if not stale:
                 raise AlreadyRunning(f"Another run started {int(age)}s ago (lock: {self.path.name})")
-            log.warning("Removing stale lock file (older than 3 hours).")
+            log.warning("Removing stale lock file (old, or its run is no longer running).")
             self.path.unlink(missing_ok=True)
         fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w") as f:
-            f.write(f"{os.getpid()} {_now()}")
+            f.write(f"{os.getpid()} {socket.gethostname()} {_now()}")
         self.acquired = True
         return self
 

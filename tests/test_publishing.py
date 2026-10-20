@@ -178,3 +178,20 @@ class PublishCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class StaleLockTests(unittest.TestCase):
+    def test_lock_from_dead_process_is_cleared(self):
+        import socket
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            with mock.patch.dict(os.environ, {"STATE_DIR": str(tmp)}):
+                (tmp / "run.lock").write_text(f"999999 {socket.gethostname()} 2026-01-01T00:00:00")
+                with run_guard.RunLock():
+                    pass
+                with run_guard.RunLock():
+                    with self.assertRaises(run_guard.AlreadyRunning):
+                        with run_guard.RunLock():
+                            pass
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)

@@ -56,6 +56,9 @@ jobs:
           key: kids-shorts-state-${{ github.run_id }}
           restore-keys: kids-shorts-state-
 
+      - name: Clear leftover lock (GitHub already prevents overlapping runs)
+        run: rm -f state/*.lock
+
       - name: Prepare YouTube login (optional - never printed, never fails the run)
         id: yt
         env:
@@ -75,6 +78,10 @@ jobs:
         if: always() && steps.yt.outputs.token_ok == 'true'
         continue-on-error: true
         run: python run_job.py --publish-check
+
+      - name: Don't save lock files in the history
+        if: always()
+        run: rm -f state/*.lock
 
       - name: Save run history
         if: always()
