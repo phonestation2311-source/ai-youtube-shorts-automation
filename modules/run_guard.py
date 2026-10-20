@@ -140,6 +140,8 @@ def already_uploaded(video_path: str, title: str):
 def record_upload(video_path: str, title: str, video_id: str):
     path = state_dir() / "upload_ledger.json"
     ledger = _read_json(path, [])
+    if video_id and any(item.get("video_id") == video_id for item in ledger):
+        return  # already recorded
     ledger.append({
         "time": _now(),
         "video_id": video_id,
@@ -176,6 +178,26 @@ def channel_has_title(title: str, youtube=None, max_items: int = 50):
 # ------------------------------------------------------------------
 # Upload gate + safe upload
 # ------------------------------------------------------------------
+def _truthy(name: str) -> bool:
+    return os.getenv(name, "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def public_approved() -> bool:
+    """Public videos need a THIRD, separate approval: UPLOAD_PUBLIC_APPROVED=true."""
+    return _truthy("UPLOAD_PUBLIC_APPROVED")
+
+
+def upload_privacy() -> str:
+    """Privacy for uploads. Default and fallback is always 'private'."""
+    p = os.getenv("UPLOAD_PRIVACY", "private").strip().lower()
+    if p not in ("private", "unlisted", "public"):
+        p = "private"
+    if p == "public" and not public_approved():
+        log.warning("Public upload requested but UPLOAD_PUBLIC_APPROVED is not true - using private.")
+        p = "private"
+    return p
+
+
 def upload_gate_open() -> bool:
     return bool(getattr(settings, "UPLOAD_ENABLED", False)) and bool(getattr(settings, "UPLOAD_APPROVED", False))
 
@@ -209,6 +231,7 @@ def safe_upload(result: dict) -> dict:
         title=title,
         description=meta.get("description", ""),
         tags=meta.get("tags", []),
+        privacy=upload_privacy(),
     )
     if video_id:
         record_upload(video_path, title, video_id)

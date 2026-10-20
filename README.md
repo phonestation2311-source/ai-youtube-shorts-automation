@@ -419,3 +419,18 @@ Before uploading, the same file/title is checked against `state/upload_ledger.js
 channel's recent uploads, so a video is never published twice.
 Failures: GitHub emails you when a scheduled run fails; optional `NOTIFY_WEBHOOK_URL`
 (Discord/Slack) or `NTFY_TOPIC` (ntfy.sh phone push) secrets send an instant message.
+
+## Safe publishing (all OFF by default)
+
+* `python run_job.py --publish-check` - publishing dry run: checks the YouTube login, channel,
+  privacy, made-for-kids flag and duplicates for the newest video. **Never uploads.**
+* Uploads need `UPLOAD_ENABLED=true` **and** `UPLOAD_APPROVED=true` (repository variables in GitHub).
+* Uploads are always **private** and **made for kids**. Public needs `UPLOAD_PRIVACY=public`
+  **and** a third approval `UPLOAD_PUBLIC_APPROVED=true`.
+* The same video/title is never uploaded twice (ledger in `state/` + check of the channel's uploads).
+
+**YOUTUBE_TOKEN_B64 secret (optional, only for publishing from GitHub):** in the Codespace run
+`base64 -w0 config/youtube_token.pickle > /tmp/yt_token_b64.txt`, open that file, copy everything,
+paste it as the secret value, then delete the file with `rm /tmp/yt_token_b64.txt`.
+Extra spaces/line breaks are handled. If the secret is missing or broken, videos are still made;
+the run only shows a warning.

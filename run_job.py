@@ -144,12 +144,76 @@ def check_ready() -> int:
     return 0 if ready else 1
 
 
+def publish_check() -> int:
+    """Publishing dry run: checks login, channel, gates, privacy and the newest
+    video's metadata/duplicates WITHOUT uploading anything. Secrets are never shown."""
+    print("Publishing dry run - nothing will be uploaded")
+    problems = []
+    enabled = getattr(settings, "UPLOAD_ENABLED", False)
+    approved = getattr(settings, "UPLOAD_APPROVED", False)
+    print(f"  Upload gate: UPLOAD_ENABLED={enabled}, UPLOAD_APPROVED={approved}"
+          f" -> {'OPEN' if run_guard.upload_gate_open() else 'CLOSED (safe)'}")
+    print(f"  Privacy used for uploads: {run_guard.upload_privacy()}")
+    made_for_kids = getattr(settings, "MADE_FOR_KIDS", None)
+    print(f"  Made for kids flag: {made_for_kids}")
+    if made_for_kids is not True:
+        problems.append("MADE_FOR_KIDS must be True for this children's channel")
+
+    yt = None
+    if not os.path.exists(settings.YOUTUBE_TOKEN_FILE):
+        problems.append("YouTube token missing (run: python -m modules.youtube_upload --auth)")
+    else:
+        from modules.youtube_upload import get_authenticated_service
+        yt = get_authenticated_service()  # never interactive here; refreshes if needed
+        if yt is None:
+            problems.append("YouTube token invalid or expired (run: python -m modules.youtube_upload --auth)")
+        else:
+            try:
+                resp = yt.channels().list(part="snippet", mine=True).execute()
+                items = resp.get("items") or []
+                print(f"  YouTube channel: {items[0]['snippet']['title'] if items else '(none found)'}")
+                if not items:
+                    problems.append("this Google account has no YouTube channel")
+            except Exception as e:
+                problems.append(f"YouTube API check failed ({type(e).__name__})")
+
+    videos = sorted(settings.OUTPUT_DIR.glob("short_*.mp4"), key=lambda x: x.stat().st_mtime)
+    if not videos:
+        problems.append("no finished video in output/")
+    else:
+        from tools.check_outputs import check_video
+        latest = videos[-1]
+        vp = check_video(latest)
+        if vp:
+            problems.append(f"{latest.name}: " + "; ".join(vp))
+        meta = run_guard._read_json(latest.with_suffix(".json"), {})
+        title = meta.get("title", "")
+        dup = run_guard.already_uploaded(str(latest), title)
+        if not dup and yt is not None and run_guard.channel_has_title(title, yt):
+            dup = "same title already on the channel"
+        print(f"  Newest video: {latest.name} | {title}")
+        if dup:
+            print(f"  Duplicate check: would SKIP ({dup})")
+        else:
+            print("  Duplicate check: not uploaded before")
+        if run_guard.upload_gate_open() and not dup:
+            print(f"  A scheduled run WOULD upload it as {run_guard.upload_privacy()}, made for kids.")
+        else:
+            print("  A scheduled run would NOT upload it.")
+
+    for p_ in problems:
+        print(f"  NO  {p_}")
+    print("PUBLISH-READY" if not problems else "NOT PUBLISH-READY")
+    return 0 if not problems else 1
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Unattended Hindi kids Shorts runner (uploads gated)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--once", action="store_true", help="make one video now (default)")
     g.add_argument("--loop", action="store_true", help="repeat every --every-hours (machine must stay on)")
     g.add_argument("--check", action="store_true", help="readiness check, no API calls")
+    g.add_argument("--publish-check", action="store_true", help="publishing dry run, never uploads")
     p.add_argument("--every-hours", type=float, default=float(os.getenv("RUN_EVERY_HOURS", 24)))
     p.add_argument("--max-attempts", type=int, default=None)
     p.add_argument("--niche", type=int, default=None, help=f"0-{len(settings.NICHES) - 1}")
@@ -157,6 +221,8 @@ def main(argv=None) -> int:
 
     if a.check:
         return check_ready()
+    if a.publish_check:
+        return publish_check()
     if a.loop:
         log.info(f"Loop mode: one video every {a.every_hours}h (stops if this machine/Codespace stops).")
         while True:

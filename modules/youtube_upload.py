@@ -135,6 +135,23 @@ def upload_video(
         log.warning("Upload blocked: needs BOTH UPLOAD_ENABLED=true and UPLOAD_APPROVED=true in .env.")
         return None
 
+    # Safety: never upload the same video/title twice; never public without a 3rd approval
+    try:
+        from modules import run_guard
+        dup = run_guard.already_uploaded(video_path, title) if os.path.exists(video_path) else ""
+        privacy = (privacy or "private").strip().lower()
+        if privacy not in ("private", "unlisted", "public"):
+            privacy = "private"
+        if privacy == "public" and not run_guard.public_approved():
+            log.warning("Public upload not approved (UPLOAD_PUBLIC_APPROVED is not true) - using private.")
+            privacy = "private"
+    except Exception as e:
+        log.error(f"Upload safety check failed ({type(e).__name__}) - not uploading.")
+        return None
+    if dup:
+        log.warning(f"Upload blocked (duplicate): {dup}")
+        return None
+
     from googleapiclient.http import MediaFileUpload
     from googleapiclient.errors import HttpError
 
@@ -190,6 +207,16 @@ def upload_video(
                 log.info(f"Upload progress: {int(status.progress() * 100)}%")
 
         video_id = response.get("id", "")
+
+        if video_id:
+
+            try:
+
+                run_guard.record_upload(video_path, title, video_id)
+
+            except Exception:
+
+                log.warning("Could not record the upload in the duplicate ledger.")
         log.info(f"Upload complete! Video ID: {video_id}")
         log.info(f"URL: https://youtube.com/shorts/{video_id}")
 

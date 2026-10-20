@@ -27,6 +27,9 @@ jobs:
       # Upload stays OFF unless you set BOTH repository variables to true.
       UPLOAD_ENABLED: ${{ vars.UPLOAD_ENABLED || 'false' }}
       UPLOAD_APPROVED: ${{ vars.UPLOAD_APPROVED || 'false' }}
+      # Uploads are private unless UPLOAD_PRIVACY=public AND UPLOAD_PUBLIC_APPROVED=true
+      UPLOAD_PRIVACY: ${{ vars.UPLOAD_PRIVACY || 'private' }}
+      UPLOAD_PUBLIC_APPROVED: ${{ vars.UPLOAD_PUBLIC_APPROVED || 'false' }}
       MAX_ATTEMPTS: "2"
       RETRY_DELAY_SECONDS: "60"
     steps:
@@ -50,25 +53,11 @@ jobs:
           key: kids-shorts-state-${{ github.run_id }}
           restore-keys: kids-shorts-state-
 
-      - name: Add YouTube login (only needed for publishing)
-        if: env.UPLOAD_ENABLED == 'true' && env.UPLOAD_APPROVED == 'true'
+      - name: Prepare YouTube login (optional - never printed, never fails the run)
+        id: yt
         env:
           YOUTUBE_TOKEN_B64: ${{ secrets.YOUTUBE_TOKEN_B64 }}
-        run: |
-          set -eu
-          test -n "$YOUTUBE_TOKEN_B64"
-          printf '%s' "$YOUTUBE_TOKEN_B64" | base64 --decode > config/youtube_token.pickle
-          test -s config/youtube_token.pickle
-
-      - name: Validate saved YouTube token (no upload)
-        env:
-          YOUTUBE_TOKEN_B64: ${{ secrets.YOUTUBE_TOKEN_B64 }}
-        run: |
-          set -eu
-          test -n "$YOUTUBE_TOKEN_B64"
-          printf '%s' "$YOUTUBE_TOKEN_B64" | base64 --decode > /tmp/youtube-token-check.pickle
-          python -c 'import pickle; pickle.load(open("/tmp/youtube-token-check.pickle", "rb")); print("YouTube token format: valid")'
-          rm -f /tmp/youtube-token-check.pickle
+        run: python -m tools.prepare_token
 
       - name: Readiness check
         run: python run_job.py --check
@@ -78,6 +67,11 @@ jobs:
 
       - name: Check the video
         run: python -m tools.check_outputs --latest
+
+      - name: Publishing dry run (never uploads)
+        if: always() && steps.yt.outputs.token_ok == 'true'
+        continue-on-error: true
+        run: python run_job.py --publish-check
 
       - name: Save run history
         if: always()
