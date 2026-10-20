@@ -92,19 +92,29 @@ class PrepareTokenMainTests(unittest.TestCase):
 
 
 class PrivacyTests(unittest.TestCase):
+    def _mode(self, env, gates=True):
+        import config.settings as st
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(st, "UPLOAD_ENABLED", gates, create=True), \
+                mock.patch.object(st, "UPLOAD_APPROVED", gates, create=True):
+            return run_guard.resolve_publish_mode()
+
     def test_default_is_private(self):
-        with mock.patch.dict(os.environ, {"UPLOAD_PRIVACY": "", "UPLOAD_PUBLIC_APPROVED": ""}):
-            self.assertEqual(run_guard.upload_privacy(), "private")
+        m = self._mode({"UPLOAD_PRIVACY": "", "UPLOAD_PUBLIC_APPROVED": ""})
+        self.assertEqual((m["privacy"], m["error"]), ("private", ""))
 
-    def test_public_needs_third_approval(self):
-        with mock.patch.dict(os.environ, {"UPLOAD_PRIVACY": "public", "UPLOAD_PUBLIC_APPROVED": "false"}):
-            self.assertEqual(run_guard.upload_privacy(), "private")
-        with mock.patch.dict(os.environ, {"UPLOAD_PRIVACY": "public", "UPLOAD_PUBLIC_APPROVED": "true"}):
-            self.assertEqual(run_guard.upload_privacy(), "public")
+    def test_public_needs_its_own_approval_and_never_falls_back(self):
+        m = self._mode({"UPLOAD_PRIVACY": "public", "UPLOAD_PUBLIC_APPROVED": "false"})
+        self.assertTrue(m["error"])
+        m = self._mode({"UPLOAD_PRIVACY": "public", "UPLOAD_PUBLIC_APPROVED": "true"})
+        self.assertEqual((m["privacy"], m["error"]), ("public", ""))
 
-    def test_unknown_value_is_private(self):
-        with mock.patch.dict(os.environ, {"UPLOAD_PRIVACY": "everyone"}):
-            self.assertEqual(run_guard.upload_privacy(), "private")
+    def test_unknown_value_is_an_error(self):
+        self.assertTrue(self._mode({"UPLOAD_PRIVACY": "everyone"})["error"])
+
+    def test_disabled_when_gates_closed(self):
+        m = self._mode({"UPLOAD_PRIVACY": "public", "UPLOAD_PUBLIC_APPROVED": "true"}, gates=False)
+        self.assertFalse(m["enabled"])
 
 
 class UploaderBehaviourTests(unittest.TestCase):
@@ -137,13 +147,27 @@ class UploaderBehaviourTests(unittest.TestCase):
         yt.videos.return_value.insert.return_value.next_chunk.return_value = (None, {"id": "FAKE123"})
         return yt
 
-    def test_public_request_is_forced_private_and_made_for_kids(self):
+    def test_public_without_approval_is_refused_not_downgraded(self):
         yt = self._fake_youtube()
-        with mock.patch.object(self.yu, "get_authenticated_service", return_value=yt):
-            vid = self.yu.upload_video(str(self.video), "चीकू #Shorts", "d", tags=["a"], privacy="public")
+        vid = self.yu.upload_video(str(self.video), "चीकू #Shorts", "d", tags=["a"], privacy="public", youtube=yt)
+        self.assertIsNone(vid)
+        yt.videos.return_value.insert.assert_not_called()
+
+    def test_private_upload_body_is_private_and_made_for_kids(self):
+        yt = self._fake_youtube()
+        vid = self.yu.upload_video(str(self.video), "चीकू #Shorts", "d", tags=["a"], privacy="private", youtube=yt)
         self.assertEqual(vid, "FAKE123")
         body = yt.videos.return_value.insert.call_args.kwargs["body"]
         self.assertEqual(body["status"]["privacyStatus"], "private")
+        self.assertIs(body["status"]["selfDeclaredMadeForKids"], True)
+
+    def test_public_upload_body_when_explicitly_approved(self):
+        yt = self._fake_youtube()
+        with mock.patch.dict(os.environ, {"UPLOAD_PUBLIC_APPROVED": "true"}):
+            vid = self.yu.upload_video(str(self.video), "चीकू #Shorts", "d", tags=["a"], privacy="public", youtube=yt)
+        self.assertEqual(vid, "FAKE123")
+        body = yt.videos.return_value.insert.call_args.kwargs["body"]
+        self.assertEqual(body["status"]["privacyStatus"], "public")
         self.assertIs(body["status"]["selfDeclaredMadeForKids"], True)
 
     def test_second_upload_of_same_video_is_blocked(self):

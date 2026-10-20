@@ -5,7 +5,8 @@ Run Guard - safety helpers for unattended runs.
 * story history      - avoid making the same story twice
 * upload ledger      - never upload the same video/title twice
 * notify()           - clear failure messages (log file, GitHub, optional webhook)
-* safe_upload()      - uploads ONLY if UPLOAD_ENABLED and UPLOAD_APPROVED are both true
+* safe_upload()      - uploads ONLY if UPLOAD_ENABLED and UPLOAD_APPROVED are both true;
+                       private by default, public only with UPLOAD_PUBLIC_APPROVED=true
 
 State lives in the state/ folder (git-ignored). Override with STATE_DIR=/path.
 """
@@ -142,12 +143,14 @@ def _norm_title(title: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"#\w+", "", title or "")).strip().lower()
 
 
-def already_uploaded(video_path: str, title: str):
-    """Return a reason string if this video/title was uploaded before, else ""."""
+def already_uploaded(video_path: str, title: str, cid: str = ""):
+    """Return a reason string if this video/story/title was uploaded before, else ""."""
     ledger = _read_json(state_dir() / "upload_ledger.json", [])
     sha = file_sha256(video_path) if os.path.exists(video_path) else ""
     nt = _norm_title(title)
     for item in ledger:
+        if cid and item.get("content_id") == cid:
+            return f"same story already uploaded as {item.get('video_id')}"
         if sha and item.get("sha256") == sha:
             return f"same video file already uploaded as {item.get('video_id')}"
         if nt and item.get("title_norm") == nt:
@@ -155,7 +158,7 @@ def already_uploaded(video_path: str, title: str):
     return ""
 
 
-def record_upload(video_path: str, title: str, video_id: str):
+def record_upload(video_path: str, title: str, video_id: str, cid: str = ""):
     path = state_dir() / "upload_ledger.json"
     ledger = _read_json(path, [])
     if video_id and any(item.get("video_id") == video_id for item in ledger):
@@ -167,95 +170,234 @@ def record_upload(video_path: str, title: str, video_id: str):
         "title_norm": _norm_title(title),
         "sha256": file_sha256(video_path) if os.path.exists(video_path) else "",
         "file": Path(video_path).name,
+        "content_id": cid,
     })
     _write_json(path, ledger)
 
 
-def channel_has_title(title: str, youtube=None, max_items: int = 50):
-    """Check the channel's recent uploads for the same title.
-    Returns True/False, or None if the check could not be done."""
-    try:
-        if youtube is None:
-            from modules.youtube_upload import get_authenticated_service
-            youtube = get_authenticated_service()
-        if youtube is None:
-            return None
-        ch = youtube.channels().list(part="contentDetails", mine=True).execute()
-        items = ch.get("items") or []
-        if not items:
-            return None
-        uploads = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
-        resp = youtube.playlistItems().list(part="snippet", playlistId=uploads, maxResults=max_items).execute()
-        nt = _norm_title(title)
-        return any(_norm_title(i["snippet"].get("title", "")) == nt for i in resp.get("items", []))
-    except Exception as e:
-        log.warning(f"Could not check channel for duplicates ({type(e).__name__}).")
-        return None
+# ------------------------------------------------------------------
+# Publishing mode + safe upload
+# ------------------------------------------------------------------
+# Channel the automation is allowed to upload to (not a secret).
+EXPECTED_CHANNEL_TITLE = "ToonMasti Hindi TV 1M"
+UPLOAD_ATTEMPTS = 2           # upload tries per run (no endless loops)
+UPLOAD_RETRY_WAIT = 30        # seconds between tries
 
 
-# ------------------------------------------------------------------
-# Upload gate + safe upload
-# ------------------------------------------------------------------
 def _truthy(name: str) -> bool:
     return os.getenv(name, "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 def public_approved() -> bool:
-    """Public videos need a THIRD, separate approval: UPLOAD_PUBLIC_APPROVED=true."""
+    """Public publishing needs its own explicit approval: UPLOAD_PUBLIC_APPROVED=true."""
     return _truthy("UPLOAD_PUBLIC_APPROVED")
-
-
-def upload_privacy() -> str:
-    """Privacy for uploads. Default and fallback is always 'private'."""
-    p = os.getenv("UPLOAD_PRIVACY", "private").strip().lower()
-    if p not in ("private", "unlisted", "public"):
-        p = "private"
-    if p == "public" and not public_approved():
-        log.warning("Public upload requested but UPLOAD_PUBLIC_APPROVED is not true - using private.")
-        p = "private"
-    return p
 
 
 def upload_gate_open() -> bool:
     return bool(getattr(settings, "UPLOAD_ENABLED", False)) and bool(getattr(settings, "UPLOAD_APPROVED", False))
 
 
+def resolve_publish_mode() -> dict:
+    """The ONE place that decides how videos are published.
+
+    disabled : UPLOAD_ENABLED and UPLOAD_APPROVED are not both true
+    private  : both true, UPLOAD_PRIVACY=private (default)
+    public   : both true, UPLOAD_PRIVACY=public AND UPLOAD_PUBLIC_APPROVED=true
+    Anything else is a configuration error - nothing is uploaded and the run fails.
+    There is no silent fallback between private and public.
+    """
+    wanted = (os.getenv("UPLOAD_PRIVACY", "") or "private").strip().lower()
+    mode = {"enabled": upload_gate_open(), "privacy": wanted, "error": ""}
+    if not mode["enabled"]:
+        mode["privacy"] = ""
+        return mode
+    if wanted not in ("private", "public"):
+        mode["error"] = f"UPLOAD_PRIVACY must be 'private' or 'public' (got '{wanted}')"
+    elif wanted == "public" and not public_approved():
+        mode["error"] = "UPLOAD_PRIVACY=public needs UPLOAD_PUBLIC_APPROVED=true - nothing uploaded"
+    return mode
+
+
+def upload_privacy() -> str:
+    """Effective privacy, or '' when uploads are disabled or misconfigured."""
+    m = resolve_publish_mode()
+    return "" if (not m["enabled"] or m["error"]) else m["privacy"]
+
+
+def describe_mode(mode: dict = None) -> str:
+    mode = mode or resolve_publish_mode()
+    if not mode["enabled"]:
+        return "DISABLED (videos are made, nothing is uploaded)"
+    if mode["error"]:
+        return f"CONFIG ERROR: {mode['error']}"
+    if mode["privacy"] == "public":
+        return "PUBLIC automatic publishing (every new video becomes publicly visible)"
+    return "PRIVATE automatic uploads (only you can see the videos)"
+
+
+def content_id(story: str) -> str:
+    """Durable ID of a story: same story text -> same ID, on any machine."""
+    text = re.sub(r"\s+", " ", story or "").strip()
+    return "ksid" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:12] if text else ""
+
+
+def verify_channel(youtube) -> dict:
+    """Make sure we are logged in to the right channel before uploading."""
+    want_id = os.getenv("EXPECTED_CHANNEL_ID", "").strip()
+    want_title = os.getenv("EXPECTED_CHANNEL_TITLE", "").strip() or EXPECTED_CHANNEL_TITLE
+    try:
+        items = youtube.channels().list(part="snippet", mine=True).execute().get("items") or []
+    except Exception as e:
+        return {"ok": False, "title": "", "id": "", "reason": f"channel lookup failed ({type(e).__name__})"}
+    if not items:
+        return {"ok": False, "title": "", "id": "", "reason": "this Google login has no YouTube channel"}
+    ch = items[0]
+    title, cid = ch.get("snippet", {}).get("title", ""), ch.get("id", "")
+    ok = (cid == want_id) if want_id else (title.strip().lower() == want_title.lower())
+    reason = "" if ok else f"logged in to '{title}' but expected '{want_id or want_title}'"
+    return {"ok": ok, "title": title, "id": cid, "reason": reason}
+
+
+def find_on_channel(youtube, title: str, cid: str, max_items: int = 50):
+    """Look through the channel's recent uploads (private ones too) for this
+    story's content ID tag or exact title. Returns the video ID, "" if not
+    found, or None if the check could not be done."""
+    try:
+        ch = youtube.channels().list(part="contentDetails", mine=True).execute()
+        items = ch.get("items") or []
+        if not items:
+            return None
+        uploads = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+        pl = youtube.playlistItems().list(part="contentDetails", playlistId=uploads,
+                                          maxResults=max_items).execute().get("items", [])
+        ids = [i["contentDetails"]["videoId"] for i in pl]
+        if not ids:
+            return ""
+        vids = youtube.videos().list(part="snippet", id=",".join(ids)).execute().get("items", [])
+        nt = _norm_title(title)
+        for v in vids:
+            sn = v.get("snippet", {})
+            if (cid and cid in (sn.get("tags") or [])) or (nt and _norm_title(sn.get("title", "")) == nt):
+                return v.get("id", "")
+        return ""
+    except Exception as e:
+        log.warning(f"Could not check the channel for duplicates ({type(e).__name__}).")
+        return None
+
+
+def channel_has_title(title: str, youtube=None, max_items: int = 50):
+    """Backwards-compatible wrapper: True/False, or None if unknown."""
+    if youtube is None:
+        from modules.youtube_upload import get_authenticated_service
+        youtube = get_authenticated_service()
+    if youtube is None:
+        return None
+    found = find_on_channel(youtube, title, "", max_items)
+    return None if found is None else bool(found)
+
+
+def validate_video(video_path: str) -> list:
+    """Full check before upload: size, FPS, length, audio, metadata AND a full decode."""
+    from tools.check_outputs import check_video
+    return check_video(Path(video_path), full_decode=True)
+
+
+def _update_metadata(meta_path: str, **fields):
+    if meta_path and os.path.exists(meta_path):
+        meta = _read_json(Path(meta_path), {})
+        meta.update(fields)
+        _write_json(Path(meta_path), meta)
+
+
 def safe_upload(result: dict) -> dict:
-    """Upload a finished video ONLY if both gates are on and it is not a duplicate."""
-    out = {"uploaded": False, "video_id": "", "reason": ""}
-    if not upload_gate_open():
-        out["reason"] = "upload gate closed (UPLOAD_ENABLED and UPLOAD_APPROVED must both be true)"
+    """Upload one finished video according to resolve_publish_mode().
+
+    status is one of: upload_disabled, config_error, video_invalid, duplicate,
+    auth_failed, wrong_channel, upload_failed, uploaded
+    """
+    out = {"status": "", "uploaded": False, "video_id": "", "privacy": "", "reason": ""}
+    mode = resolve_publish_mode()
+    if not mode["enabled"]:
+        out.update(status="upload_disabled",
+                   reason="upload gate closed (UPLOAD_ENABLED and UPLOAD_APPROVED must both be true)")
         log.info(f"Not uploading: {out['reason']}")
         return out
+    if mode["error"]:
+        out.update(status="config_error", reason=mode["error"])
+        log.error(f"Not uploading: {out['reason']}")
+        return out
+    out["privacy"] = mode["privacy"]
+    log.info(f"Publishing mode: {describe_mode(mode)}")
 
     video_path = result.get("video_path", "")
-    meta = _read_json(Path(result.get("metadata_path", "")), {}) if result.get("metadata_path") else {}
+    meta_path = result.get("metadata_path", "")
+    meta = _read_json(Path(meta_path), {}) if meta_path else {}
     title = meta.get("title", "")
     if not video_path or not os.path.exists(video_path) or not title:
-        out["reason"] = "missing video file or title"
+        out.update(status="video_invalid", reason="missing video file or title")
+        return out
+    problems = validate_video(video_path)
+    if problems:
+        out.update(status="video_invalid", reason="; ".join(problems))
+        log.error(f"Not uploading - video failed checks: {out['reason']}")
         return out
 
-    dup = already_uploaded(video_path, title)
-    if not dup and channel_has_title(title):
-        dup = "a video with the same title is already on the channel"
+    cid = content_id(meta.get("story", "")) or content_id(file_sha256(video_path))
+    dup = already_uploaded(video_path, title, cid)
     if dup:
-        out["reason"] = f"duplicate - {dup}"
-        log.warning(f"Not uploading: {out['reason']}")
+        out.update(status="duplicate", reason=dup)
+        log.warning(f"Not uploading (duplicate): {dup}")
         return out
 
-    from modules.youtube_upload import upload_video
-    video_id = upload_video(
-        video_path=video_path,
-        title=title,
-        description=meta.get("description", ""),
-        tags=meta.get("tags", []),
-        privacy=upload_privacy(),
-    )
-    if video_id:
-        record_upload(video_path, title, video_id)
-        out.update(uploaded=True, video_id=video_id)
-    else:
-        out["reason"] = "upload failed (see logs/automation.log)"
+    from modules.youtube_upload import get_authenticated_service, upload_video
+    youtube = get_authenticated_service()
+    if youtube is None:
+        out.update(status="auth_failed", reason="YouTube login missing, expired or revoked - "
+                   "reconnect with: python -m modules.youtube_upload --auth, then update the YOUTUBE_TOKEN_B64 secret")
+        log.error(out["reason"])
+        return out
+    ch = verify_channel(youtube)
+    if not ch["ok"]:
+        out.update(status="wrong_channel", reason=ch["reason"])
+        log.error(f"Not uploading: {ch['reason']}")
+        return out
+    log.info(f"Uploading to channel: {ch['title']}")
+
+    found = find_on_channel(youtube, title, cid)
+    if found:
+        record_upload(video_path, title, found, cid)
+        out.update(status="duplicate", video_id=found, reason=f"already on the channel as {found}")
+        log.warning(f"Not uploading (duplicate): {out['reason']}")
+        return out
+
+    tags = list(dict.fromkeys(list(meta.get("tags", [])) + [cid]))
+    for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+        video_id = upload_video(
+            video_path=video_path,
+            title=title,
+            description=meta.get("description", ""),
+            tags=tags,
+            privacy=mode["privacy"],
+            youtube=youtube,
+        )
+        if not video_id:
+            # The request may have failed AFTER YouTube accepted the video:
+            # look before trying again, so a retry never creates a duplicate.
+            time.sleep(UPLOAD_RETRY_WAIT if attempt < UPLOAD_ATTEMPTS else 0)
+            video_id = find_on_channel(youtube, title, cid) or ""
+            if video_id:
+                log.warning(f"Upload reported an error but the video is on the channel: {video_id}")
+        if video_id:
+            record_upload(video_path, title, video_id, cid)
+            _update_metadata(meta_path, uploaded=True, video_id=video_id, privacy=mode["privacy"],
+                             channel=ch["title"], content_id=cid)
+            out.update(status="uploaded", uploaded=True, video_id=video_id)
+            log.info(f"Uploaded as {mode['privacy']}: https://youtube.com/shorts/{video_id}")
+            return out
+        log.warning(f"Upload attempt {attempt}/{UPLOAD_ATTEMPTS} failed.")
+
+    out.update(status="upload_failed", reason=f"upload failed after {UPLOAD_ATTEMPTS} attempts (see logs/automation.log)")
+    _update_metadata(meta_path, uploaded=False, upload_error=out["reason"])
     return out
 
 

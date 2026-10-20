@@ -84,8 +84,12 @@ def main() -> int:
         print("YouTube token: OK (saved for this run; contents not shown)")
     else:
         print(f"YouTube token: not used ({why}). Video generation continues; no upload possible this run.")
-        if raw.strip() and os.getenv("GITHUB_ACTIONS") == "true":
-            print(f"::warning title=YouTube token::{why}. Re-create the YOUTUBE_TOKEN_B64 secret (see README).")
+        uploads_on = all(os.getenv(k, "").strip().lower() in ("1", "true", "yes", "on")
+                         for k in ("UPLOAD_ENABLED", "UPLOAD_APPROVED"))
+        if os.getenv("GITHUB_ACTIONS") == "true" and (raw.strip() or uploads_on):
+            level = "error" if uploads_on else "warning"
+            print(f"::{level} title=YouTube token::{why}. Re-create the YOUTUBE_TOKEN_B64 secret (see README)."
+                  + (" Uploads are ON, so today's upload will fail." if uploads_on else ""))
     out = os.getenv("GITHUB_OUTPUT")
     if out:
         with open(out, "a", encoding="utf-8") as f:

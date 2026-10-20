@@ -33,7 +33,19 @@ def _deva_ratio(text: str) -> float:
     return sum("ऀ" <= c <= "ॿ" for c in letters) / len(letters) if letters else 0.0
 
 
-def check_video(mp4: Path) -> list:
+def decodes_cleanly(path: Path) -> str:
+    """Decode every frame; returns "" if the file plays cleanly, else the error."""
+    try:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=300)
+    except Exception as e:
+        return f"decode check could not run ({type(e).__name__})"
+    if r.returncode != 0 or r.stderr.strip():
+        return "video does not decode cleanly: " + (r.stderr.strip().splitlines() or ["error"])[0][:150]
+    return ""
+
+
+def check_video(mp4: Path, full_decode: bool = False) -> list:
     problems = []
     info = probe(mp4)
     streams = info.get("streams", [])
@@ -51,6 +63,10 @@ def check_video(mp4: Path) -> list:
         problems.append(f"duration {dur:.1f}s (want 20-{VIDEO_MAX_DURATION}s)")
     if not any(s.get("codec_type") == "audio" for s in streams):
         problems.append("no audio")
+    if full_decode:
+        err = decodes_cleanly(mp4)
+        if err:
+            problems.append(err)
 
     meta_path = mp4.with_suffix(".json")
     if not meta_path.exists():

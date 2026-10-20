@@ -96,15 +96,20 @@ class UploadGateTests(StateDirTest):
 
     def test_duplicate_is_not_uploaded_twice(self):
         res = self._result()
+        yt = mock.MagicMock()
         with mock.patch.object(settings, "UPLOAD_ENABLED", True, create=True), \
                 mock.patch.object(settings, "UPLOAD_APPROVED", True, create=True), \
-                mock.patch.object(run_guard, "channel_has_title", return_value=False), \
+                mock.patch.dict(os.environ, {"UPLOAD_PRIVACY": "private"}), \
+                mock.patch.object(run_guard, "validate_video", return_value=[]), \
+                mock.patch.object(run_guard, "verify_channel", return_value={"ok": True, "title": "T", "id": "C", "reason": ""}), \
+                mock.patch.object(run_guard, "find_on_channel", return_value=""), \
+                mock.patch("modules.youtube_upload.get_authenticated_service", return_value=yt), \
                 mock.patch("modules.youtube_upload.upload_video", return_value="vid1") as up:
             first = run_guard.safe_upload(res)
             second = run_guard.safe_upload(res)
         self.assertTrue(first["uploaded"])
         self.assertFalse(second["uploaded"])
-        self.assertIn("duplicate", second["reason"])
+        self.assertEqual(second["status"], "duplicate")
         self.assertEqual(up.call_count, 1)
 
     def test_uploader_itself_refuses_when_gate_closed(self):
@@ -126,7 +131,7 @@ class RunJobTests(StateDirTest):
         self.assertEqual(fake.call_count, 2)
         note.assert_called_once()
         last = json.loads((Path(self.tmp) / "last_run.json").read_text(encoding="utf-8"))
-        self.assertEqual(last["status"], "failed")
+        self.assertEqual(last["status"], "generation_failed")
 
     def test_success_does_not_upload_when_gate_closed(self):
         video = Path(self.tmp) / "short_9.mp4"
@@ -143,7 +148,7 @@ class RunJobTests(StateDirTest):
         up.assert_not_called()
         self.assertTrue(fake.call_args.kwargs.get("dry_run"))
         last = json.loads((Path(self.tmp) / "last_run.json").read_text(encoding="utf-8"))
-        self.assertEqual(last["status"], "ok")
+        self.assertEqual(last["status"], "upload_disabled")
         self.assertFalse(last["uploaded"])
 
     def test_locked_run_is_skipped(self):

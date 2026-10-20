@@ -75,20 +75,32 @@ def run_once(max_attempts: int = None, retry_delay: int = None, niche_index: int
                         if story:
                             run_guard.record_story(story, meta.get("idea", ""))
                         upload = run_guard.safe_upload(result)
+                        status = upload["status"]
                         run_guard.record_run({
-                            "status": "ok",
+                            "status": status,
                             "video": Path(result.get("video_path", "")).name,
                             "title": meta.get("title", ""),
                             "duration": result.get("duration"),
                             "uploaded": upload["uploaded"],
                             "video_id": upload["video_id"],
-                            "upload_note": upload["reason"],
+                            "privacy": upload["privacy"],
+                            "reason": upload["reason"],
                             "attempts": attempt,
                         })
-                        log.info(f"Run finished OK: {result.get('video_path')}")
-                        if upload["reason"].startswith(("duplicate", "upload failed", "missing")):
-                            run_guard.notify("Upload skipped", upload["reason"], level="info")
-                        return 0
+                        log.info(f"Run finished: {status} - {result.get('video_path')}")
+                        if status == "uploaded":
+                            run_guard.notify("Video uploaded",
+                                             f"{meta.get('title', '')} -> https://youtube.com/shorts/{upload['video_id']}"
+                                             f" ({upload['privacy']})", level="info")
+                            return 0
+                        if status in ("upload_disabled", "duplicate"):
+                            if status == "duplicate":
+                                run_guard.notify("Upload skipped", upload["reason"], level="info")
+                            return 0
+                        # auth_failed / wrong_channel / config_error / video_invalid / upload_failed
+                        run_guard.notify(f"Upload FAILED ({status})",
+                                         f"{upload['reason']}. The video is kept as a GitHub artifact.")
+                        return 1
                 else:
                     errors.append(result.get("error") or "unknown error")
                     log.error(f"Attempt {attempt} failed: {errors[-1]}")
@@ -105,8 +117,8 @@ def run_once(max_attempts: int = None, retry_delay: int = None, niche_index: int
         errors.append(f"{type(e).__name__}: {e}")
 
     msg = f"All {max_attempts} attempt(s) failed. Last error: {errors[-1] if errors else 'unknown'}"
-    run_guard.record_run({"status": "failed", "errors": errors[-3:]})
-    run_guard.notify("Video run FAILED", msg)
+    run_guard.record_run({"status": "generation_failed", "errors": errors[-3:]})
+    run_guard.notify("Video generation FAILED", msg)
     return 1
 
 
@@ -145,17 +157,21 @@ def check_ready() -> int:
 
 
 def publish_check() -> int:
-    """Publishing dry run: checks login, channel, gates, privacy and the newest
-    video's metadata/duplicates WITHOUT uploading anything. Secrets are never shown."""
+    """Publishing dry run. Checks the publishing mode, YouTube login, channel,
+    made-for-kids flag and the newest video (full decode + duplicates).
+    It NEVER uploads, so it cannot prove that an upload itself will succeed."""
     print("Publishing dry run - nothing will be uploaded")
     problems = []
-    enabled = getattr(settings, "UPLOAD_ENABLED", False)
-    approved = getattr(settings, "UPLOAD_APPROVED", False)
-    print(f"  Upload gate: UPLOAD_ENABLED={enabled}, UPLOAD_APPROVED={approved}"
-          f" -> {'OPEN' if run_guard.upload_gate_open() else 'CLOSED (safe)'}")
-    print(f"  Privacy used for uploads: {run_guard.upload_privacy()}")
+    mode = run_guard.resolve_publish_mode()
+    print(f"  UPLOAD_ENABLED={getattr(settings, 'UPLOAD_ENABLED', False)}, "
+          f"UPLOAD_APPROVED={getattr(settings, 'UPLOAD_APPROVED', False)}, "
+          f"UPLOAD_PRIVACY={os.getenv('UPLOAD_PRIVACY', '') or 'private'}, "
+          f"UPLOAD_PUBLIC_APPROVED={run_guard.public_approved()}")
+    print(f"  Effective publishing mode: {run_guard.describe_mode(mode)}")
+    if mode["error"]:
+        problems.append(mode["error"])
     made_for_kids = getattr(settings, "MADE_FOR_KIDS", None)
-    print(f"  Made for kids flag: {made_for_kids}")
+    print(f"  Made for kids (selfDeclaredMadeForKids): {made_for_kids}")
     if made_for_kids is not True:
         problems.append("MADE_FOR_KIDS must be True for this children's channel")
 
@@ -166,44 +182,40 @@ def publish_check() -> int:
         from modules.youtube_upload import get_authenticated_service
         yt = get_authenticated_service()  # never interactive here; refreshes if needed
         if yt is None:
-            problems.append("YouTube token invalid or expired (run: python -m modules.youtube_upload --auth)")
+            problems.append("YouTube token invalid, expired or revoked (run: python -m modules.youtube_upload --auth)")
         else:
-            try:
-                resp = yt.channels().list(part="snippet", mine=True).execute()
-                items = resp.get("items") or []
-                print(f"  YouTube channel: {items[0]['snippet']['title'] if items else '(none found)'}")
-                if not items:
-                    problems.append("this Google account has no YouTube channel")
-            except Exception as e:
-                problems.append(f"YouTube API check failed ({type(e).__name__})")
+            ch = run_guard.verify_channel(yt)
+            print(f"  YouTube channel: {ch['title'] or '(unknown)'} -> {'OK' if ch['ok'] else 'WRONG'}")
+            if not ch["ok"]:
+                problems.append(ch["reason"])
 
     videos = sorted(settings.OUTPUT_DIR.glob("short_*.mp4"), key=lambda x: x.stat().st_mtime)
     if not videos:
         problems.append("no finished video in output/")
     else:
-        from tools.check_outputs import check_video
         latest = videos[-1]
-        vp = check_video(latest)
+        vp = run_guard.validate_video(str(latest))
+        print(f"  Newest video: {latest.name} -> {'passes all checks incl. full decode' if not vp else 'FAILS'}")
         if vp:
             problems.append(f"{latest.name}: " + "; ".join(vp))
         meta = run_guard._read_json(latest.with_suffix(".json"), {})
         title = meta.get("title", "")
-        dup = run_guard.already_uploaded(str(latest), title)
-        if not dup and yt is not None and run_guard.channel_has_title(title, yt):
-            dup = "same title already on the channel"
-        print(f"  Newest video: {latest.name} | {title}")
-        if dup:
-            print(f"  Duplicate check: would SKIP ({dup})")
-        else:
-            print("  Duplicate check: not uploaded before")
-        if run_guard.upload_gate_open() and not dup:
-            print(f"  A scheduled run WOULD upload it as {run_guard.upload_privacy()}, made for kids.")
+        cid = run_guard.content_id(meta.get("story", ""))
+        dup = run_guard.already_uploaded(str(latest), title, cid)
+        if not dup and yt is not None:
+            found = run_guard.find_on_channel(yt, title, cid)
+            dup = f"already on the channel as {found}" if found else ""
+        print(f"  Title: {title}")
+        print(f"  Duplicate check: {'would SKIP (' + dup + ')' if dup else 'not uploaded before'}")
+        if mode["enabled"] and not mode["error"] and not dup:
+            print(f"  A scheduled run WOULD upload it as {mode['privacy'].upper()}, made for kids.")
         else:
             print("  A scheduled run would NOT upload it.")
 
     for p_ in problems:
         print(f"  NO  {p_}")
     print("PUBLISH-READY" if not problems else "NOT PUBLISH-READY")
+    print("  (A dry run checks configuration, login and the video; it does not prove YouTube will accept an upload.)")
     return 0 if not problems else 1
 
 

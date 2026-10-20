@@ -25,14 +25,16 @@ jobs:
       NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       # Upload stays OFF unless you set BOTH repository variables to true.
-      # SAFETY LOCK: uploads from GitHub are switched OFF in code until the owner gives final approval.
-      # The repository variables are ignored while this lock is here. To unlock later (owner only), replace the
-      # two "false" values with ${{ vars.UPLOAD_ENABLED || 'false' }} and ${{ vars.UPLOAD_APPROVED || 'false' }}.
-      UPLOAD_ENABLED: "false"
-      UPLOAD_APPROVED: "false"
-      # Uploads are private unless UPLOAD_PRIVACY=public AND UPLOAD_PUBLIC_APPROVED=true
+      # Publishing is controlled ONLY by these repository variables (Settings > Secrets and variables > Actions):
+      #   UPLOAD_ENABLED + UPLOAD_APPROVED = true        -> upload every day
+      #   UPLOAD_PRIVACY = private (default) or public  -> privacy of new videos
+      #   UPLOAD_PUBLIC_APPROVED = true                 -> required for public
+      UPLOAD_ENABLED: ${{ vars.UPLOAD_ENABLED || 'false' }}
+      UPLOAD_APPROVED: ${{ vars.UPLOAD_APPROVED || 'false' }}
       UPLOAD_PRIVACY: ${{ vars.UPLOAD_PRIVACY || 'private' }}
       UPLOAD_PUBLIC_APPROVED: ${{ vars.UPLOAD_PUBLIC_APPROVED || 'false' }}
+      # Uploads only go to this channel (ID from vars, otherwise the channel name is checked)
+      EXPECTED_CHANNEL_ID: ${{ vars.EXPECTED_CHANNEL_ID || '' }}
       MAX_ATTEMPTS: "2"
       RETRY_DELAY_SECONDS: "60"
     steps:
@@ -68,7 +70,7 @@ jobs:
       - name: Readiness check
         run: python run_job.py --check
 
-      - name: Make one video (uploads only if both gates are true)
+      - name: Make one video and upload it (if publishing is enabled)
         run: python run_job.py --once
 
       - name: Check the video

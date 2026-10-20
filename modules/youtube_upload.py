@@ -126,6 +126,7 @@ def upload_video(
     category_id: str = "24",  # 24 = Entertainment (kids stories)
     privacy: str = "private",  # private first, so you can review on YouTube
     is_short: bool = True,
+    youtube=None,
 ) -> Optional[str]:
     """
     Upload a video to YouTube.
@@ -143,8 +144,8 @@ def upload_video(
         if privacy not in ("private", "unlisted", "public"):
             privacy = "private"
         if privacy == "public" and not run_guard.public_approved():
-            log.warning("Public upload not approved (UPLOAD_PUBLIC_APPROVED is not true) - using private.")
-            privacy = "private"
+            log.error("Public upload refused: UPLOAD_PUBLIC_APPROVED is not true. Nothing uploaded.")
+            return None
     except Exception as e:
         log.error(f"Upload safety check failed ({type(e).__name__}) - not uploading.")
         return None
@@ -155,7 +156,7 @@ def upload_video(
     from googleapiclient.http import MediaFileUpload
     from googleapiclient.errors import HttpError
 
-    youtube = get_authenticated_service()
+    youtube = youtube or get_authenticated_service()
     if not youtube:
         return None
 
