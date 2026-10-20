@@ -25,8 +25,11 @@ jobs:
       NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       # Upload stays OFF unless you set BOTH repository variables to true.
-      UPLOAD_ENABLED: ${{ vars.UPLOAD_ENABLED || 'false' }}
-      UPLOAD_APPROVED: ${{ vars.UPLOAD_APPROVED || 'false' }}
+      # SAFETY LOCK: uploads from GitHub are switched OFF in code until the owner gives final approval.
+      # The repository variables are ignored while this lock is here. To unlock later (owner only), replace the
+      # two "false" values with ${{ vars.UPLOAD_ENABLED || 'false' }} and ${{ vars.UPLOAD_APPROVED || 'false' }}.
+      UPLOAD_ENABLED: "false"
+      UPLOAD_APPROVED: "false"
       # Uploads are private unless UPLOAD_PRIVACY=public AND UPLOAD_PUBLIC_APPROVED=true
       UPLOAD_PRIVACY: ${{ vars.UPLOAD_PRIVACY || 'private' }}
       UPLOAD_PUBLIC_APPROVED: ${{ vars.UPLOAD_PUBLIC_APPROVED || 'false' }}
